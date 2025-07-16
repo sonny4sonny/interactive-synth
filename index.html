@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Ferrofluid Synth Playground</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    html, body { margin:0; padding:0; overflow:hidden; background:#000; color:#fff; font-family:sans-serif; }
+    #controls { position:absolute; bottom:10px; left:50%; transform:translateX(-50%); display:flex; gap:10px; z-index:10; }
+    .btn { background:none; border:1px solid #fff; color:#fff; padding:5px 10px; cursor:pointer; }
+    .btn.active { background:#fff; color:#000; }
+  </style>
+</head>
+<body>
+  <div id="controls">
+    <button id="recordBtn" class="btn">Record</button>
+    <button id="playBtn" class="btn">Play</button>
+    <button id="overdubBtn" class="btn">Overdub</button>
+    <button id="clearBtn" class="btn">Clear</button>
+    <button id="undoBtn" class="btn">Undo</button>
+  </div>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.6.0/p5.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.8.35/Tone.min.js"></script>
+  <script>
+    // --- Globals ---
+    let particles = [], numParticles = 500;
+    let zones = [], synths = {};
+    let recording = false, overdub = false;
+    let loopData = [], pastLoops = [];
+    let startTime = 0;
+    let lastTrigger = 0, triggerInterval = 0.1; // throttle interval (s)
+    let audioUnlocked = false;
+
+    // Unlock AudioContext on first interaction
+    function unlockAudio() {
+      if (!audioUnlocked) {
+        Tone.start().then(() => console.log('Audio unlocked')).catch(e => console.error(e));
+        audioUnlocked = true;
+      }
+    }
+    window.addEventListener('mousedown', unlockAudio, { once: true });
+    window.addEventListener('touchstart', unlockAudio, { once: true });
+
+    // --- p5.js setup & draw ---
+    function setup() {
+      createCanvas(windowWidth, windowHeight);
+      for (let i = 0; i < numParticles; i++) particles.push(new Particle());
+      updateZones();
+      initAudio();
+      setupControls();
+    }
+
+    function windowResized() {
+      resizeCanvas(windowWidth, windowHeight);
+      updateZones();
+    }
+
+    function draw() {
+      background(0);
+      particles.forEach(p => { p.update(); p.show(); });
+    }
+
+    // --- Particles & Fluid simulation ---
+    function updateZones() {
+      zones = [
+        { x: 0, w: width/3, trigger: 'kick' },
+        { x: width/3, w: width/3, trigger: 'hat' },
+        { x: 2*width/3, w: width/3, trigger: 'pad' }
+      ];
+    }
+
+    class Particle {
+      constructor() {
+        this.pos = createVector(random(width), random(height));
+        this.vel = createVector();
+        this.acc = createVector();
+      }
+      applyForce(f) { this.acc.add(f); }
+      update() {
+        let m = createVector(mouseX, mouseY);
+        let dir = p5.Vector.sub(m, this.pos);
+        let d = dir.mag();
+        if (d < 150) {
+          dir.normalize().mult((150 - d) * 0.0005);
+          this.applyForce(dir);
+        }
+        let n = noise(this.pos.x * 0.005, this.pos.y * 0.005, frameCount * 0.005) * TWO_PI * 2;
+        this.applyForce(p5.Vector.fromAngle(n).mult(0.1));
+        this.vel.add(this.acc).limit(2);
+        this.pos.add(this.vel);
+        this.acc.mult(0);
+        if (this.pos.x < 0) this.pos.x = width;
+        if (this.pos.x > width) this.pos.x = 0;
+        if (this.pos.y < 0) this.pos.y = height;
+        if (this.pos.y > height) this.pos.y = 0;
+      }
+      show() {
+        noStroke(); fill(255);
+        circle(this.pos.x, this.pos.y, 2);
+      }
+    }
+
+    // --- Audio Setup ---
+    function initAudio() {
+      synths.kick = new Tone.MembraneSynth({ volume: -8 }).toDestination();
+      synths.hat  = new Tone.NoiseSynth({ noise:{type:'white'}, envelope:{attack:0.001, decay:0.1}, volume:-12 }).toDestination();
+      synths.pad  = new Tone.PolySynth(Tone.FMSynth, { volume:-10, modulationIndex:12, harmonicity:3, envelope:{attack:0.5, release:1} }).toDestination();
+      console.log('Audio initialized');
+    }
+
+    // Immediate trigger & record
+    function handleTrigger(x) {
+      const now = Tone.now();
+      if (now - lastTrigger < triggerInterval) return; // throttle
+      lastTrigger = now;
+      const z = zones.find(z => x >= z.x && x < z.x + z.w);
+      if (!z) return;
+      // immediate sound
+      triggerSound(z.trigger, now);
+      // record event
+      if (recording) loopData.push({ time: now - startTime, x });
+    }
+
+    // Play all loops once or overdub allowed
+    function playLoops() {
+      if (pastLoops.length === 0) return;
+      const now = Tone.now();
+      // find maximum loop length
+      let maxTime = 0;
+      pastLoops.forEach(loop => loop.forEach(evt => { if (evt.time > maxTime) maxTime = evt.time; }));
+      // schedule events for each loop
+      pastLoops.forEach(loop => {
+        loop.forEach(evt => scheduleTrigger(evt, now));
+      });
+      // repeat after loop end:
+      setTimeout(playLoops, (maxTime + 0.1) * 1000);
+    }
+
+    // Schedule a single event
+    function scheduleTrigger(evt, when) {
+      const z = zones.find(z => evt.x >= z.x && evt.x < z.x + z.w);
+      if (!z) return;
+      triggerSound(z.trigger, when + evt.time);
+    }
+
+    // Core synth attack helper
+    function triggerSound(type, time) {
+      switch (type) {
+        case 'kick': synths.kick.triggerAttackRelease('C2', '8n', time); break;
+        case 'hat':  synths.hat.triggerAttackRelease('8n', time); break;
+        case 'pad':  synths.pad.triggerAttackRelease(['E4','G4','B4'][floor(random(3))], '4n', time); break;
+      }
+    }
+
+    // p5 pointer events
+    function mousePressed() { handleTrigger(mouseX); }
+    function mouseDragged() { handleTrigger(mouseX); }
+    function touchStarted() { handleTrigger(touchX); }
+    function touchMoved() { handleTrigger(touchX); }
+
+    // --- UI Control Handlers ---
+    function setupControls() {
+      const recordBtn = document.getElementById('recordBtn');
+      const playBtn   = document.getElementById('playBtn');
+      const overdubBtn= document.getElementById('overdubBtn');
+      const clearBtn  = document.getElementById('clearBtn');
+      const undoBtn   = document.getElementById('undoBtn');
+
+      recordBtn.onclick = () => {
+        if (!recording) {
+          recording = true; overdub = false; loopData = [];
+          startTime = Tone.now(); recordBtn.classList.add('active');
+        } else {
+          recording = false; pastLoops.push([...loopData]); recordBtn.classList.remove('active');
+        }
+      };
+
+      playBtn.onclick = () => {
+        clearInterval(); // stop any existing repeats
+        playLoops();
+      };
+
+      overdubBtn.onclick = () => {
+        if (!overdub) {
+          overdub = true; recording = true; loopData = [];
+          startTime = Tone.now(); overdubBtn.classList.add('active');
+        } else {
+          overdub = false; recording = false;
+          pastLoops.push([...loopData]); overdubBtn.classList.remove('active');
+        }
+      };
+
+      clearBtn.onclick = () => { pastLoops = []; loopData = []; };
+      undoBtn.onclick  = () => { pastLoops.pop(); };
+    }
+  </script>
+</body>
+</html>
